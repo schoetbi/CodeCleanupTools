@@ -4,32 +4,10 @@ using System.IO;
 using System.Linq;
 using System.Text;
 
+using CommandLine.Text;
+
 class TextAndWhitespace
 {
-    private static readonly HashSet<string> removeConsecutiveEmptyLinesFromExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-    {
-        "ps1",
-        "psm1",
-    };
-
-    private static readonly HashSet<string> trimTrailingWhitespaceFromExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-    {
-        "cs",
-        "ps1",
-        "psm1",
-        "csproj",
-        "xaml",
-    };
-
-    private static readonly Dictionary<string, int> replaceLeadingTabsWithSpaces = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
-    {
-        { "cs", 4 },
-        { "csproj", 2 },
-        { "ps1", 4 },
-        { "psm1", 4 },
-        { "xaml", 2 },
-    };
-
     private static readonly HashSet<string> binaryExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
         "exe",
@@ -49,40 +27,42 @@ class TextAndWhitespace
 
     static void Main(string[] args)
     {
-        if (args.Length > 1)
+        var options = new CommandLineOptions();
+        if (CommandLine.Parser.Default.ParseArguments(args, options))
         {
-            PrintHelp();
+            if (options.ShowHelp)
+            {
+                var txt = HelpText.AutoBuild(options);
+                Console.Write(txt.ToString());
+                return;
+            }
+        }
+        else
+        {
+            var txt = HelpText.AutoBuild(options);
+            Console.Write(txt.ToString());
             return;
         }
 
-        var pattern = "*.*";
-        if (args.Length == 1)
-        {
-            if (args[0] == "/?" || args[0] == "-h" || args[0] == "-help" || args[0] == "/help")
-            {
-                PrintHelp();
-                return;
-            }
-
-            pattern = args[0];
-        }
-
-        var folder = Environment.CurrentDirectory;
-        var fileInfos = GetNonHiddenFiles(new DirectoryInfo(folder), pattern);
+        var folder = options.StartDirectory ?? Environment.CurrentDirectory;
+        var fileInfos = GetNonHiddenFiles(new DirectoryInfo(folder), options.FilePattern);
         foreach (var file in fileInfos)
         {
-            ProcessFile(file.FullName);
+            ProcessFile(options, file.FullName);
         }
     }
 
     private static IList<FileInfo> GetNonHiddenFiles(DirectoryInfo baseDirectory, string pattern)
     {
-        var fileInfos = new List<System.IO.FileInfo>();
-        fileInfos.AddRange(baseDirectory.GetFiles(pattern, SearchOption.TopDirectoryOnly).Where(f => (f.Attributes & FileAttributes.Hidden) == 0));
+        var fileInfos = baseDirectory.GetFiles(pattern, SearchOption.TopDirectoryOnly).Where(f => (f.Attributes & FileAttributes.Hidden) == 0)
+            .ToList();
 
         // skip hidden directories (like .git) and directories that start with '.'
         // that are not hidden (like .nuget).
-        foreach (var directory in baseDirectory.GetDirectories("*.*", SearchOption.TopDirectoryOnly).Where(w => (w.Attributes & FileAttributes.Hidden) == 0 && !w.Name.StartsWith(".")))
+        var subdirectories = baseDirectory.GetDirectories("*.*", SearchOption.TopDirectoryOnly)
+            .Where(w => (w.Attributes & FileAttributes.Hidden) == 0 && !w.Name.StartsWith("."));
+
+        foreach (var directory in subdirectories)
         {
             fileInfos.AddRange(GetNonHiddenFiles(directory, pattern));
         }
@@ -90,30 +70,52 @@ class TextAndWhitespace
         return fileInfos;
     }
 
-    public static void ProcessFile(string file)
+    public static void ProcessFile(CommandLineOptions options, string file)
     {
         if (IsBinary(file))
         {
             return;
         }
 
-        var text = File.ReadAllText(file);
-        if (text.Contains('\uFFFD'))
+        Encoding inputEncoding = null;
+        string text = null;
+
+        StreamReader reader = null;
+
+        try
         {
-            // it's not Unicode, let's try Default
-            text = File.ReadAllText(file, Encoding.Default);
+            reader = new StreamReader(file, Encoding.UTF8, true);
+            text = reader.ReadToEnd();
+            inputEncoding = reader.CurrentEncoding;
+        }
+        catch (Exception)
+        {
+            return;
+        }
+        finally
+        {
+            reader?.Dispose();
         }
 
-        var extension = Path.GetExtension(file).TrimStart('.').ToLowerInvariant();
+        var outputEncoding = options.EncodingName != null ? Encoding.GetEncoding(options.EncodingName) : inputEncoding;
 
-        var newText = ProcessText(text, extension);
-        if (newText != text)
+        var extension = Path.GetExtension(file)?.TrimStart('.').ToLowerInvariant();
+
+        var newText = ProcessText(options, text, extension);
+        if (newText != text || options.EncodingName != null)
         {
-            File.WriteAllText(file, newText);
+            File.Delete(file);
+            using (var outStream = File.OpenWrite(file))
+            {
+                using (var writer = new StreamWriter(outStream, outputEncoding))
+                {
+                    writer.Write(newText);
+                }
+            }
         }
     }
 
-    public static string ProcessText(string text, string extension)
+    public static string ProcessText(CommandLineOptions options, string text, string extension)
     {
         if (IsGeneratedCode(text) || text.IndexOf('\0') > -1)
         {
@@ -121,20 +123,22 @@ class TextAndWhitespace
         }
 
         var newText = text;
-        newText = EnsureCrLf(newText);
-
-        int spaces = 4;
-        if (replaceLeadingTabsWithSpaces.TryGetValue(extension, out spaces))
+        if (options.EnsureCrLf)
         {
-            newText = ReplaceLeadingTabsWithSpaces(newText, spaces);
+            newText = EnsureCrLf(newText);
         }
 
-        if (trimTrailingWhitespaceFromExtensions.Contains(extension))
+        if (options.ConvertTabsToSpaces)
+        {
+            newText = ReplaceLeadingTabsWithSpaces(newText, options.Spaces);
+        }
+
+        if (options.TrimTrailingWhitespace)
         {
             newText = TrimTrailingWhitespaceFromEveryLine(newText);
         }
 
-        if (removeConsecutiveEmptyLinesFromExtensions.Contains(extension))
+        if (options.RemoveConsecutiveEmptyLines)
         {
             newText = RemoveConsecutiveEmptyLines(newText);
         }
@@ -183,7 +187,12 @@ class TextAndWhitespace
 
     private static bool IsBinary(string file)
     {
-        var extension = Path.GetExtension(file).TrimStart('.');
+        var extension = Path.GetExtension(file)?.TrimStart('.');
+        if (extension == null)
+        {
+            return true;
+        }
+
         return binaryExtensions.Contains(extension);
     }
 
